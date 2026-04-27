@@ -12,3 +12,5 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 musicbrainz_rs = { version = "0.13", features = ["async"] }
 rspotify = "0.16.1"
 chrono = "0.4.44"
+futures = "0.3.32"
+anyhow = "1.0.102"

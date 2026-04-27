@@ -7,12 +7,17 @@ use axum::{
 };
 use rspotify::{model::FullTrack, prelude::*, ClientCredsSpotify, Credentials};
 use serde::Serialize;
-use sqlx::sqlite::SqlitePool;
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::env;
 use std::time::Duration;
 
 // --- Schema Definition ---
 const SYNC_DB_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS `sync_queue` (
+  `id` TEXT PRIMARY KEY NOT NULL,
+  `status` TEXT NOT NULL DEFAULT 'queued'
+);
+
 CREATE TABLE IF NOT EXISTS `available_markets` (
   `rowid` integer PRIMARY KEY NOT NULL,
   `available_markets` text NOT NULL
@@ -34,15 +39,11 @@ CREATE TABLE IF NOT EXISTS `albums` (
   `name` text NOT NULL,
   `album_type` text NOT NULL,
   `available_markets_rowid` integer NOT NULL,
-  `external_id_upc` text,
-  `copyright_c` text,
-  `copyright_p` text,
   `label` text NOT NULL,
   `popularity` integer NOT NULL,
   `release_date` text NOT NULL,
   `release_date_precision` text NOT NULL,
   `total_tracks` integer NOT NULL,
-  `external_id_ean` text,
   FOREIGN KEY (`available_markets_rowid`) REFERENCES `available_markets`(`rowid`)
 );
 
@@ -78,25 +79,11 @@ CREATE TABLE IF NOT EXISTS `album_images` (
   FOREIGN KEY (`album_rowid`) REFERENCES `albums`(`rowid`)
 );
 
-CREATE TABLE IF NOT EXISTS `missing_tracks_queue` (
-    `rowid` integer PRIMARY KEY NOT NULL,
-    `track_id` text NOT NULL,
-    `enqueued_at` integer NOT NULL,
-    `status` text NOT NULL,
-    `attempts` integer NOT NULL DEFAULT 0,
-    `last_attempt_at` integer
-);
-
--- Indices for performance
 CREATE INDEX IF NOT EXISTS `tracks_id_unique` ON `tracks` (`id`);
-CREATE INDEX IF NOT EXISTS `tracks_isrc` ON `tracks` (`external_id_isrc`);
 CREATE INDEX IF NOT EXISTS `track_artists_track_id` ON `track_artists` (`track_rowid`);
 CREATE INDEX IF NOT EXISTS `album_images_album_id` ON `album_images` (`album_rowid`);
-CREATE UNIQUE INDEX IF NOT EXISTS `missing_tracks_queue_track_id_unique` ON `missing_tracks_queue` (`track_id`);
-CREATE INDEX IF NOT EXISTS `missing_tracks_queue_status_rowid` ON `missing_tracks_queue` (`status`, `rowid`);
 "#;
 
-// --- JSON Query Template ---
 const JSON_RECONSTRUCT_QUERY: &str = r#"
     SELECT json_object(
         'id', t.id,
@@ -149,12 +136,6 @@ struct AppState {
     sync_pool: SqlitePool,
 }
 
-#[derive(sqlx::FromRow)]
-struct QueuedTrack {
-    rowid: i64,
-    track_id: String,
-}
-
 // --- API Handler ---
 
 fn clean_spotify_id(input: &str) -> String {
@@ -178,7 +159,7 @@ async fn resolve_track(
     let clean_id = clean_spotify_id(&raw_id);
     let end_range = format!("{}{}", clean_id, "{");
 
-    // Check Legacy (Read-Only)
+    // 1. Check Legacy (Read-Only)
     if let Ok(Some(row)) = sqlx::query_as::<_, SpotifyTrackExport>(JSON_RECONSTRUCT_QUERY)
         .bind(&clean_id)
         .bind(&end_range)
@@ -188,7 +169,7 @@ async fn resolve_track(
         return (StatusCode::OK, Json(row.spotify_data)).into_response();
     }
 
-    // Check Sync (New Data)
+    // 2. Check Sync (New Data)
     if let Ok(Some(row)) = sqlx::query_as::<_, SpotifyTrackExport>(JSON_RECONSTRUCT_QUERY)
         .bind(&clean_id)
         .bind(&end_range)
@@ -198,20 +179,39 @@ async fn resolve_track(
         return (StatusCode::OK, Json(row.spotify_data)).into_response();
     }
 
-    // Fail -> Queue
-    if queue_missing_track(&state.sync_pool, &clean_id)
-        .await
-        .is_err()
-    {
+    // 3. Check Current Queue / Failure State
+    let queue_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM sync_queue WHERE id = ?")
+            .bind(&clean_id)
+            .fetch_optional(&state.sync_pool)
+            .await
+            .unwrap_or(None);
+
+    if let Some(status) = queue_status {
+        if status == "failed" {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"status": "failed", "reason": "unresolvable"})),
+            )
+                .into_response();
+        }
+
+        // If it's 'queued' or 'processing', acknowledge it is actively being worked on
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"status": "queue_error"})),
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": status})),
         )
             .into_response();
     }
 
+    // 4. Add to Database Queue
+    let _ = sqlx::query("INSERT INTO sync_queue (id, status) VALUES (?, 'queued')")
+        .bind(&clean_id)
+        .execute(&state.sync_pool)
+        .await;
+
     (
-        StatusCode::NOT_FOUND,
+        StatusCode::ACCEPTED,
         Json(serde_json::json!({"status": "queued"})),
     )
         .into_response()
@@ -225,89 +225,60 @@ async fn spotify_worker(sync_pool: SqlitePool) {
     spotify.request_token().await.ok();
 
     loop {
-        if let Ok(Some(queued)) = take_next_queued_track(&sync_pool).await {
-            if let Ok(tid) = rspotify::model::TrackId::from_id(&queued.track_id) {
+        // Atomic Pop: Update to processing and return the ID in one query
+        let next_id: Option<String> = sqlx::query_scalar(
+            "UPDATE sync_queue SET status = 'processing' WHERE id = (SELECT id FROM sync_queue WHERE status = 'queued' LIMIT 1) RETURNING id"
+        )
+        .fetch_optional(&sync_pool)
+        .await
+        .unwrap_or(None);
+
+        if let Some(id) = next_id {
+            let mut success = false;
+
+            if let Ok(tid) = rspotify::model::TrackId::from_id(&id) {
                 if let Ok(track) = spotify.track(tid, None).await {
                     if save_to_sync_db(&sync_pool, track).await.is_ok() {
-                        let _ = remove_queued_track(&sync_pool, queued.rowid).await;
-                    } else {
-                        let _ = reset_queued_track(&sync_pool, queued.rowid).await;
+                        success = true;
+                        println!("Synced: {}", id);
                     }
-                } else {
-                    let _ = reset_queued_track(&sync_pool, queued.rowid).await;
                 }
-            } else {
-                let _ = remove_queued_track(&sync_pool, queued.rowid).await;
             }
+
+            if success {
+                // Remove from queue completely on success
+                let _ = sqlx::query("DELETE FROM sync_queue WHERE id = ?")
+                    .bind(&id)
+                    .execute(&sync_pool)
+                    .await;
+            } else {
+                // Mark as failed so the API stops re-queuing it
+                let _ = sqlx::query("UPDATE sync_queue SET status = 'failed' WHERE id = ?")
+                    .bind(&id)
+                    .execute(&sync_pool)
+                    .await;
+                println!("Marked as failed: {}", id);
+            }
+        } else {
+            // Queue is empty, sleep longer
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
-async fn queue_missing_track(pool: &SqlitePool, track_id: &str) -> Result<(), sqlx::Error> {
-    let now = chrono::Utc::now().timestamp();
-    sqlx::query(
-        "INSERT OR IGNORE INTO missing_tracks_queue (track_id, enqueued_at, status, attempts) VALUES (?, ?, 'pending', 0)",
-    )
-    .bind(track_id)
-    .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-async fn take_next_queued_track(pool: &SqlitePool) -> Result<Option<QueuedTrack>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-
-    let queued = sqlx::query_as::<_, QueuedTrack>(
-        "SELECT rowid, track_id FROM missing_tracks_queue WHERE status = 'pending' ORDER BY rowid LIMIT 1",
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if let Some(item) = queued.as_ref() {
-        let now = chrono::Utc::now().timestamp();
-        sqlx::query(
-            "UPDATE missing_tracks_queue SET status = 'processing', attempts = attempts + 1, last_attempt_at = ? WHERE rowid = ?",
-        )
-        .bind(now)
-        .bind(item.rowid)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    tx.commit().await?;
-    Ok(queued)
-}
-
-async fn remove_queued_track(pool: &SqlitePool, rowid: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM missing_tracks_queue WHERE rowid = ?")
-        .bind(rowid)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-async fn reset_queued_track(pool: &SqlitePool, rowid: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE missing_tracks_queue SET status = 'pending' WHERE rowid = ?")
-        .bind(rowid)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> Result<(), sqlx::Error> {
+async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     let now = chrono::Utc::now().timestamp();
 
-    // 1. Markets
     sqlx::query(
         "INSERT OR IGNORE INTO available_markets (rowid, available_markets) VALUES (1, 'ALL')",
     )
     .execute(&mut *tx)
     .await?;
 
-    // 2. Album
     let album = track.album;
     let album_id = album
         .id
@@ -316,7 +287,7 @@ async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> Result<(), sqlx
         .unwrap_or_default();
     sqlx::query(
         "INSERT OR IGNORE INTO albums (id, fetched_at, name, album_type, available_markets_rowid, label, popularity, release_date, release_date_precision, total_tracks) 
-         VALUES (?, ?, ?, ?, 1, 'Unknown', ?, ?, ?, ?)"
+         VALUES (?, ?, ?, ?, 1, 'Unknown', ?, ?, ?, ?)",
     )
     .bind(&album_id)
     .bind(now)
@@ -339,14 +310,13 @@ async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> Result<(), sqlx
             "INSERT INTO album_images (album_rowid, width, height, url) VALUES (?, ?, ?, ?)",
         )
         .bind(album_rowid)
-        .bind(img.width.unwrap_or_default() as i64)
-        .bind(img.height.unwrap_or_default() as i64)
-        .bind(&img.url)
+        .bind(img.width.unwrap_or(0) as i64)
+        .bind(img.height.unwrap_or(0) as i64)
+        .bind(img.url)
         .execute(&mut *tx)
         .await?;
     }
 
-    // 3. Track
     let tid = track
         .id
         .as_ref()
@@ -355,15 +325,15 @@ async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> Result<(), sqlx
     let isrc = track.external_ids.get("isrc").cloned();
     sqlx::query(
         "INSERT OR IGNORE INTO tracks (id, fetched_at, name, preview_url, album_rowid, track_number, external_id_isrc, popularity, available_markets_rowid, disc_number, duration_ms, explicit)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)"
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
     )
     .bind(&tid)
     .bind(now)
     .bind(&track.name)
-    .bind(track.preview_url.as_deref())
+    .bind(&track.preview_url)
     .bind(album_rowid)
     .bind(track.track_number as i64)
-    .bind(isrc.as_deref())
+    .bind(isrc)
     .bind(0_i64)
     .bind(track.disc_number as i64)
     .bind(track.duration.num_milliseconds())
@@ -376,19 +346,20 @@ async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> Result<(), sqlx
         .fetch_one(&mut *tx)
         .await?;
 
-    // 4. Artists
     for artist in track.artists {
         let aid = artist
             .id
             .as_ref()
             .map(|id| id.to_string())
             .unwrap_or_default();
-        sqlx::query("INSERT OR IGNORE INTO artists (id, fetched_at, name, followers_total, popularity) VALUES (?, ?, ?, 0, 0)")
-            .bind(&aid)
-            .bind(now)
-            .bind(&artist.name)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO artists (id, fetched_at, name, followers_total, popularity) VALUES (?, ?, ?, 0, 0)",
+        )
+        .bind(&aid)
+        .bind(now)
+        .bind(&artist.name)
+        .execute(&mut *tx)
+        .await?;
         let a_rowid: i64 = sqlx::query_scalar("SELECT rowid FROM artists WHERE id = ?")
             .bind(&aid)
             .fetch_one(&mut *tx)
@@ -410,13 +381,18 @@ async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> Result<(), sqlx
 
 #[tokio::main]
 async fn main() {
-    let legacy_url = env::var("LEGACY_DB_URL").expect("LEGACY_DB_URL must be set (with ?mode=ro)");
+    let legacy_url =
+        env::var("LEGACY_DB_URL").expect("LEGACY_DB_URL required (e.g. sqlite://old.db?mode=ro)");
     let sync_url = env::var("SYNC_DB_URL").unwrap_or_else(|_| "sqlite://sync.db".to_string());
 
     let legacy_pool = SqlitePool::connect(&legacy_url).await.unwrap();
-    let sync_pool = SqlitePool::connect(&sync_url).await.unwrap();
+    let sync_pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&sync_url)
+        .await
+        .unwrap();
 
-    // --- CRITICAL: Initialize Schema in the Sync DB ---
+    // Initialize Schema
     sqlx::query(SYNC_DB_SCHEMA)
         .execute(&sync_pool)
         .await
@@ -427,12 +403,14 @@ async fn main() {
         sync_pool: sync_pool.clone(),
     };
 
+    // Start Worker
     let worker_pool = sync_pool.clone();
     tokio::spawn(async move { spotify_worker(worker_pool).await });
 
     let app = Router::new()
         .route("/api/isrc/:id", get(resolve_track))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:2345").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    println!("API Running on :3000 | Redis-free queue active.");
     axum::serve(listener, app).await.unwrap();
 }
