@@ -21,7 +21,7 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
-COPY --from=builder /usr/src/app/target/release/isrc-api /app/isrc-api
+COPY --from=builder /usr/src/app/target/release/spotify-isrc-api /app/isrc-api
 
 RUN mkdir /app/data
 
