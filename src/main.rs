@@ -391,8 +391,8 @@ async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> anyhow::Result<
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let legacy_url =
-        env::var("LEGACY_DB_URL").expect("LEGACY_DB_URL required (e.g. sqlite://old.db?mode=ro)");
+    let legacy_url = env::var("LEGACY_DB_URL")
+        .context("LEGACY_DB_URL required (e.g. sqlite://old.db?mode=ro)")?;
     let legacy_url = with_sqlite_mode_if_missing(&legacy_url, "ro");
 
     let sync_url_raw = env::var("SYNC_DB_URL").unwrap_or_else(|_| "sqlite://sync.db".to_string());
