@@ -255,9 +255,9 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/api/isrc/:id", get(resolve_isrc))
-        .route("/api/spotify/:isrc", get(reverse_lookup))
-        .route("/api/search", get(search_tracks))
-        .route("/api/isrc/batch", get(batch_resolve))
+        //.route("/api/spotify/:isrc", get(reverse_lookup))
+        //.route("/api/search", get(search_tracks))
+        //.route("/api/isrc/batch", get(batch_resolve))
         .with_state(pool);
 
     let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
