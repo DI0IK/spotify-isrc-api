@@ -1,3 +1,4 @@
+use anyhow::Context;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -150,6 +151,15 @@ fn clean_spotify_id(input: &str) -> String {
         .last()
         .unwrap_or(input)
         .to_string()
+}
+
+fn with_sqlite_mode_if_missing(url: &str, mode: &str) -> String {
+    if !url.starts_with("sqlite:") || url.contains("mode=") {
+        return url.to_string();
+    }
+
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}mode={mode}")
 }
 
 async fn resolve_track(
@@ -380,23 +390,28 @@ async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> anyhow::Result<
 // --- Main ---
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let legacy_url =
         env::var("LEGACY_DB_URL").expect("LEGACY_DB_URL required (e.g. sqlite://old.db?mode=ro)");
-    let sync_url = env::var("SYNC_DB_URL").unwrap_or_else(|_| "sqlite://sync.db".to_string());
+    let legacy_url = with_sqlite_mode_if_missing(&legacy_url, "ro");
 
-    let legacy_pool = SqlitePool::connect(&legacy_url).await.unwrap();
+    let sync_url_raw = env::var("SYNC_DB_URL").unwrap_or_else(|_| "sqlite://sync.db".to_string());
+    let sync_url = with_sqlite_mode_if_missing(&sync_url_raw, "rwc");
+
+    let legacy_pool = SqlitePool::connect(&legacy_url)
+        .await
+        .with_context(|| format!("Failed to open LEGACY_DB_URL: {legacy_url}"))?;
     let sync_pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect(&sync_url)
         .await
-        .unwrap();
+        .with_context(|| format!("Failed to open SYNC_DB_URL: {sync_url}"))?;
 
     // Initialize Schema
     sqlx::query(SYNC_DB_SCHEMA)
         .execute(&sync_pool)
         .await
-        .expect("Failed to init Sync DB schema");
+        .context("Failed to initialize sync DB schema")?;
 
     let state = AppState {
         legacy_pool,
@@ -410,7 +425,13 @@ async fn main() {
     let app = Router::new()
         .route("/api/isrc/:id", get(resolve_track))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .context("Failed to bind to 0.0.0.0:3000")?;
     println!("API Running on :3000 | Redis-free queue active.");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .await
+        .context("API server crashed")?;
+
+    Ok(())
 }
