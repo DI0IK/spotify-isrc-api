@@ -2,7 +2,12 @@
 # UPDATED: Use the latest stable 1.x Rust compiler on Debian Bookworm
 FROM rust:1-slim-bookworm AS builder
 
-RUN apt-get update && apt-get install -y build-essential
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends \
+		build-essential \
+		pkg-config \
+		libssl-dev \
+	&& rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
 
@@ -18,6 +23,12 @@ RUN cargo build --release
 # --- Stage 2: Runtime ---
 # UPDATED: Use Bookworm to match the builder's libc version
 FROM debian:bookworm-slim
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends \
+		ca-certificates \
+		libssl3 \
+	&& rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
