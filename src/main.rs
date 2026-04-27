@@ -191,14 +191,14 @@ async fn batch_resolve(
             .into_response();
     }
 
+    // Using a Common Table Expression (CTE) to find the IDs first, then join.
+    // This is significantly faster for batch operations.
     let mut query_builder = QueryBuilder::new(
         r#"
-        SELECT t.id as spotify_id, t.name as title, t.external_id_isrc as isrc,
-        GROUP_CONCAT(a.name, ', ') as artist
-        FROM tracks t
-        LEFT JOIN track_artists ta ON t.rowid = ta.track_rowid
-        LEFT JOIN artists a ON ta.artist_rowid = a.rowid
-        WHERE (
+        WITH selected_tracks AS (
+            SELECT t.rowid, t.id as spotify_id, t.name as title, t.external_id_isrc as isrc
+            FROM tracks t
+            WHERE 
     "#,
     );
 
@@ -210,7 +210,21 @@ async fn batch_resolve(
         separated.push_bind_unseparated(end);
         separated.push_unseparated(")");
     }
-    query_builder.push(") GROUP BY t.id");
+
+    query_builder.push(
+        r#"
+        )
+        SELECT 
+            st.spotify_id, 
+            st.title, 
+            st.isrc,
+            GROUP_CONCAT(a.name, ', ') as artist
+        FROM selected_tracks st
+        LEFT JOIN track_artists ta ON st.rowid = ta.track_rowid
+        LEFT JOIN artists a ON ta.artist_rowid = a.rowid
+        GROUP BY st.spotify_id
+    "#,
+    );
 
     let query = query_builder.build_query_as::<TrackData>();
 
