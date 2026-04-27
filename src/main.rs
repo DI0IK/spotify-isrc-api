@@ -140,17 +140,19 @@ struct AppState {
 // --- API Handler ---
 
 fn clean_spotify_id(input: &str) -> String {
-    input
+    let stripped = input
         .split('?')
         .next()
         .unwrap_or(input)
         .split('/')
         .last()
-        .unwrap_or(input)
-        .split(':')
-        .last()
-        .unwrap_or(input)
-        .to_string()
+        .unwrap_or(input);
+
+    spotify_id_tail(stripped)
+}
+
+fn spotify_id_tail(input: &str) -> String {
+    input.rsplit(':').next().unwrap_or(input).to_string()
 }
 
 fn with_sqlite_mode_if_missing(url: &str, mode: &str) -> String {
@@ -245,12 +247,13 @@ async fn spotify_worker(sync_pool: SqlitePool) {
 
         if let Some(id) = next_id {
             let mut success = false;
+            let lookup_id = spotify_id_tail(&id);
 
-            if let Ok(tid) = rspotify::model::TrackId::from_id(&id) {
+            if let Ok(tid) = rspotify::model::TrackId::from_id(&lookup_id) {
                 if let Ok(track) = spotify.track(tid, None).await {
                     if save_to_sync_db(&sync_pool, track).await.is_ok() {
                         success = true;
-                        println!("Synced: {}", id);
+                        println!("Synced: {}", lookup_id);
                     }
                 }
             }
@@ -293,7 +296,7 @@ async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> anyhow::Result<
     let album_id = album
         .id
         .as_ref()
-        .map(|id| id.to_string())
+        .map(|id| spotify_id_tail(&id.to_string()))
         .unwrap_or_default();
     sqlx::query(
         "INSERT OR IGNORE INTO albums (id, fetched_at, name, album_type, available_markets_rowid, label, popularity, release_date, release_date_precision, total_tracks) 
@@ -330,7 +333,7 @@ async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> anyhow::Result<
     let tid = track
         .id
         .as_ref()
-        .map(|id| id.to_string())
+        .map(|id| spotify_id_tail(&id.to_string()))
         .unwrap_or_default();
     let isrc = track.external_ids.get("isrc").cloned();
     sqlx::query(
@@ -360,7 +363,7 @@ async fn save_to_sync_db(pool: &SqlitePool, track: FullTrack) -> anyhow::Result<
         let aid = artist
             .id
             .as_ref()
-            .map(|id| id.to_string())
+            .map(|id| spotify_id_tail(&id.to_string()))
             .unwrap_or_default();
         sqlx::query(
             "INSERT OR IGNORE INTO artists (id, fetched_at, name, followers_total, popularity) VALUES (?, ?, ?, 0, 0)",
