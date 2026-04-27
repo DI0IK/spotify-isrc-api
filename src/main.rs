@@ -32,6 +32,16 @@ struct BatchParams {
     ids: String,
 }
 
+fn clean_spotify_id(input: &str) -> String {
+    let no_params = input.split('?').next().unwrap_or(input);
+    let no_slashes = no_params.split('/').last().unwrap_or(no_params);
+    no_slashes
+        .split(':')
+        .last()
+        .unwrap_or(no_slashes)
+        .to_string()
+}
+
 // --- ENDPOINTS ---
 
 // 1. Health Check
@@ -41,9 +51,15 @@ async fn health_check() -> &'static str {
 
 // 2. Resolve ISRC from Spotify ID
 async fn resolve_isrc(
-    Path(spotify_id): Path<String>,
+    Path(raw_id): Path<String>,
     State(pool): State<SqlitePool>,
 ) -> impl IntoResponse {
+    let clean_id = clean_spotify_id(&raw_id);
+
+    // To use the index, we check if the ID is between 'abc' and 'abc{ '
+    // (the curly brace '{' is the character immediately following 'z' and 'Z' in ASCII/UTF-8)
+    let end_range = format!("{}{}", clean_id, "{");
+
     let query = r#"
         SELECT 
             t.id as spotify_id,
@@ -53,12 +69,14 @@ async fn resolve_isrc(
         FROM tracks t
         LEFT JOIN track_artists ta ON t.rowid = ta.track_rowid
         LEFT JOIN artists a ON ta.artist_rowid = a.rowid
-        WHERE t.id = ?
+        WHERE t.id >= ? AND t.id < ?
         GROUP BY t.id
+        LIMIT 1
     "#;
 
     match sqlx::query_as::<_, TrackData>(query)
-        .bind(&spotify_id)
+        .bind(&clean_id)
+        .bind(&end_range)
         .fetch_optional(&pool)
         .await
     {
@@ -154,7 +172,18 @@ async fn batch_resolve(
     Query(params): Query<BatchParams>,
     State(pool): State<SqlitePool>,
 ) -> impl IntoResponse {
-    if params.ids.trim().is_empty() {
+    let id_pairs: Vec<(String, String)> = params
+        .ids
+        .split(',')
+        .map(|s| {
+            let start = clean_spotify_id(s.trim());
+            let end = format!("{}{}", start, "{");
+            (start, end)
+        })
+        .filter(|(s, _)| !s.is_empty())
+        .collect();
+
+    if id_pairs.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "No IDs provided"})),
@@ -162,40 +191,26 @@ async fn batch_resolve(
             .into_response();
     }
 
-    let spotify_ids: Vec<&str> = params
-        .ids
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if spotify_ids.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "No valid IDs provided"})),
-        )
-            .into_response();
-    }
-
     let mut query_builder = QueryBuilder::new(
         r#"
-        SELECT 
-            t.id as spotify_id,
-            t.name as title, 
-            t.external_id_isrc as isrc,
-            GROUP_CONCAT(a.name, ', ') as artist
+        SELECT t.id as spotify_id, t.name as title, t.external_id_isrc as isrc,
+        GROUP_CONCAT(a.name, ', ') as artist
         FROM tracks t
         LEFT JOIN track_artists ta ON t.rowid = ta.track_rowid
         LEFT JOIN artists a ON ta.artist_rowid = a.rowid
-        WHERE t.id IN (
+        WHERE (
     "#,
     );
 
-    let mut separated = query_builder.separated(", ");
-    for id in spotify_ids {
-        separated.push_bind(id);
+    let mut separated = query_builder.separated(" OR ");
+    for (start, end) in id_pairs {
+        separated.push("(t.id >= ");
+        separated.push_bind_unseparated(start);
+        separated.push_unseparated(" AND t.id < ");
+        separated.push_bind_unseparated(end);
+        separated.push_unseparated(")");
     }
-    separated.push_unseparated(") GROUP BY t.id");
+    query_builder.push(") GROUP BY t.id");
 
     let query = query_builder.build_query_as::<TrackData>();
 
