@@ -1,13 +1,13 @@
 use anyhow::Context;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::get,
     Router,
 };
 use rspotify::{model::FullTrack, prelude::*, ClientCredsSpotify, Credentials};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::env;
 use std::time::Duration;
@@ -83,6 +83,59 @@ CREATE TABLE IF NOT EXISTS `album_images` (
 CREATE INDEX IF NOT EXISTS `tracks_id_unique` ON `tracks` (`id`);
 CREATE INDEX IF NOT EXISTS `track_artists_track_id` ON `track_artists` (`track_rowid`);
 CREATE INDEX IF NOT EXISTS `album_images_album_id` ON `album_images` (`album_rowid`);
+CREATE INDEX IF NOT EXISTS `idx_tracks_name_nocase` ON `tracks` (`name` COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS `idx_artists_name_nocase` ON `artists` (`name` COLLATE NOCASE);
+"#;
+
+#[derive(Deserialize)]
+struct MatchQuery {
+    track: String,
+    artist: String,
+}
+
+// Case-insensitive track + artist lookup directly using your schema
+const MATCH_QUERY: &str = r#"
+    SELECT json_object(
+        'id', t.id,
+        'name', t.name,
+        'popularity', t.popularity,
+        'track_number', t.track_number,
+        'disc_number', t.disc_number,
+        'duration_ms', t.duration_ms,
+        'explicit', CASE WHEN t.explicit = 1 THEN json('true') ELSE json('false') END,
+        'preview_url', t.preview_url,
+        'external_ids', json_object('isrc', t.external_id_isrc),
+        'album', (
+            SELECT json_object(
+                'id', al.id,
+                'name', al.name,
+                'album_type', al.album_type,
+                'release_date', al.release_date,
+                'release_date_precision', al.release_date_precision,
+                'total_tracks', al.total_tracks,
+                'images', (
+                    SELECT json_group_array(json_object(
+                        'url', img.url, 'width', img.width, 'height', img.height
+                    )) FROM album_images img WHERE img.album_rowid = al.rowid
+                )
+            ) FROM albums al WHERE al.rowid = t.album_rowid
+        ),
+        'artists', (
+            SELECT json_group_array(json_object(
+                'id', art.id,
+                'name', art.name
+            )) FROM artists art
+            JOIN track_artists ta ON art.rowid = ta.artist_rowid
+            WHERE ta.track_rowid = t.rowid
+        )
+    ) as spotify_data
+    FROM tracks t
+    JOIN track_artists ta ON ta.track_rowid = t.rowid
+    JOIN artists art ON art.rowid = ta.artist_rowid
+    WHERE t.name = ? COLLATE NOCASE 
+      AND art.name = ? COLLATE NOCASE
+    ORDER BY t.popularity DESC
+    LIMIT 1
 "#;
 
 const JSON_RECONSTRUCT_QUERY: &str = r#"
@@ -225,6 +278,44 @@ async fn resolve_track(
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({"status": "queued"})),
+    )
+        .into_response()
+}
+
+async fn match_track(
+    Query(params): Query<MatchQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let clean_track = params.track.trim();
+    let clean_artist = params.artist.trim();
+
+    // 1. Check Legacy DB
+    if let Ok(Some(row)) = sqlx::query_as::<_, SpotifyTrackExport>(MATCH_QUERY)
+        .bind(clean_track)
+        .bind(clean_artist)
+        .fetch_optional(&state.legacy_pool)
+        .await
+    {
+        return (StatusCode::OK, Json(row.spotify_data)).into_response();
+    }
+
+    // 2. Check Sync DB
+    if let Ok(Some(row)) = sqlx::query_as::<_, SpotifyTrackExport>(MATCH_QUERY)
+        .bind(clean_track)
+        .bind(clean_artist)
+        .fetch_optional(&state.sync_pool)
+        .await
+    {
+        return (StatusCode::OK, Json(row.spotify_data)).into_response();
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "Track not found",
+            "track": clean_track,
+            "artist": clean_artist
+        })),
     )
         .into_response()
 }
@@ -427,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/api/isrc/:id", get(resolve_track))
+        .route("/api/match", get(match_track))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
